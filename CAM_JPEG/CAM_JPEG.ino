@@ -90,6 +90,68 @@ void sendKick(int pwm, int ms) {
   RoverSerial.print(buf);
 }
 
+void sendTrim(int l, int r) {
+  if (l < 50) l = 50;
+  if (l > 100) l = 100;
+  if (r < 50) r = 50;
+  if (r > 100) r = 100;
+  char buf[20];
+  snprintf(buf, sizeof(buf), "#w%d,%d\n", l, r);
+  RoverSerial.print(buf);
+}
+
+// ---- Uno -> CAM telemetry (GPIO15 via resistor divider) ----
+#define SCAN_MAX 40
+static portMUX_TYPE telMux = portMUX_INITIALIZER_UNLOCKED;
+static int16_t scanDeg[SCAN_MAX];
+static int16_t scanCm[SCAN_MAX];
+static volatile int scanCount = 0;
+static volatile bool scanDone = false;
+static volatile bool scanActive = false;
+static volatile int lastDistCm = -1;          // -1 = never received
+static volatile uint32_t lastDistMs = 0;
+static char rxLine[32];
+static int rxLen = 0;
+
+void handleRoverLine(const char *l) {
+  if (l[0] == 'U' && l[1] == ',') {
+    lastDistCm = atoi(l + 2);
+    lastDistMs = millis();
+    return;
+  }
+  if (l[0] == 'D' && l[1] == ',') {
+    const char *v = l + 2;
+    portENTER_CRITICAL(&telMux);
+    if (strncmp(v, "START", 5) == 0) {
+      scanCount = 0; scanDone = false; scanActive = true;
+    } else if (strncmp(v, "END", 3) == 0 || strncmp(v, "ABORT", 5) == 0) {
+      scanDone = true; scanActive = false;
+    } else {
+      int deg = 0, cm = 0;
+      if (sscanf(v, "%d,%d", &deg, &cm) == 2 && scanCount < SCAN_MAX) {
+        scanDeg[scanCount] = deg;
+        scanCm[scanCount] = cm;
+        scanCount++;
+      }
+    }
+    portEXIT_CRITICAL(&telMux);
+  }
+}
+
+void pollRoverSerial() {
+  while (RoverSerial.available()) {
+    char c = (char)RoverSerial.read();
+    if (c == '\r') continue;
+    if (c == '\n' || rxLen >= (int)sizeof(rxLine) - 1) {
+      rxLine[rxLen] = 0;
+      if (rxLen > 0) handleRoverLine(rxLine);
+      rxLen = 0;
+      continue;
+    }
+    rxLine[rxLen++] = c;
+  }
+}
+
 void sendTurnCap(int pwm) {
   if (pwm < 0) pwm = 0;
   if (pwm > 255) pwm = 255;
@@ -103,6 +165,11 @@ static esp_err_t root_handler(httpd_req_t *req) {
     "GET /move?dir=F|B|L|R|S|0-9\n"
     "GET /kick?pwm=0-255&ms=0-500\n"
     "GET /turncap?pwm=0-255\n"
+    "GET /trim?l=50-100&r=50-100\n"
+    "GET /stopcm?cm=0-400\n"
+    "GET /scan/start\n"
+    "GET /scan\n"
+    "GET /dist\n"
     "GET /capture\n"
     "GET /stream\n"
     "GET /status\n";
@@ -184,6 +251,77 @@ static esp_err_t kick_handler(httpd_req_t *req) {
   return httpd_resp_send(req, "ok", 2);
 }
 
+static esp_err_t trim_handler(httpd_req_t *req) {
+  char q[64];
+  char l_s[8] = {0}, r_s[8] = {0};
+  if (httpd_req_get_url_query_len(req) == 0 ||
+      httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+      httpd_query_key_value(q, "l", l_s, sizeof(l_s)) != ESP_OK ||
+      httpd_query_key_value(q, "r", r_s, sizeof(r_s)) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need l and r");
+    return ESP_FAIL;
+  }
+  sendTrim(atoi(l_s), atoi(r_s));
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, "ok", 2);
+}
+
+static esp_err_t stopcm_handler(httpd_req_t *req) {
+  char q[64];
+  char cm_s[8] = {0};
+  if (httpd_req_get_url_query_len(req) == 0 ||
+      httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+      httpd_query_key_value(q, "cm", cm_s, sizeof(cm_s)) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need cm");
+    return ESP_FAIL;
+  }
+  int cm = atoi(cm_s);
+  if (cm < 0) cm = 0;
+  if (cm > 400) cm = 400;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "#u%d\n", cm);
+  RoverSerial.print(buf);
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, "ok", 2);
+}
+
+static esp_err_t scan_start_handler(httpd_req_t *req) {
+  portENTER_CRITICAL(&telMux);
+  scanCount = 0; scanDone = false; scanActive = true;
+  portEXIT_CRITICAL(&telMux);
+  RoverSerial.print("#s\n");
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, "ok", 2);
+}
+
+static esp_err_t scan_handler(httpd_req_t *req) {
+  static char out[SCAN_MAX * 16 + 48];
+  int16_t d[SCAN_MAX], c[SCAN_MAX];
+  int n; bool done;
+  portENTER_CRITICAL(&telMux);
+  n = scanCount; done = scanDone;
+  for (int i = 0; i < n; i++) { d[i] = scanDeg[i]; c[i] = scanCm[i]; }
+  portEXIT_CRITICAL(&telMux);
+  int len = snprintf(out, sizeof(out), "{\"done\":%s,\"points\":[", done ? "true" : "false");
+  for (int i = 0; i < n && len < (int)sizeof(out) - 20; i++) {
+    len += snprintf(out + len, sizeof(out) - len, "%s[%d,%d]", i ? "," : "", d[i], c[i]);
+  }
+  len += snprintf(out + len, sizeof(out) - len, "]}");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, out, len);
+}
+
+static esp_err_t dist_handler(httpd_req_t *req) {
+  char buf[64];
+  int cm = lastDistCm;
+  long age = (cm < 0) ? -1 : (long)(millis() - lastDistMs);
+  snprintf(buf, sizeof(buf), "{\"cm\":%d,\"age_ms\":%ld}", cm, age);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t capture_handler(httpd_req_t *req) {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
@@ -229,7 +367,7 @@ void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
-  config.max_uri_handlers = 10;
+  config.max_uri_handlers = 16;
   config.max_open_sockets = 7;
   config.lru_purge_enable = true;
 
@@ -240,6 +378,11 @@ void startCameraServer() {
   httpd_uri_t status = { .uri = "/status", .method = HTTP_GET, .handler = status_handler };
   httpd_uri_t kick = { .uri = "/kick", .method = HTTP_GET, .handler = kick_handler };
   httpd_uri_t turncap = { .uri = "/turncap", .method = HTTP_GET, .handler = turncap_handler };
+  httpd_uri_t trim = { .uri = "/trim", .method = HTTP_GET, .handler = trim_handler };
+  httpd_uri_t stopcm = { .uri = "/stopcm", .method = HTTP_GET, .handler = stopcm_handler };
+  httpd_uri_t scanstart = { .uri = "/scan/start", .method = HTTP_GET, .handler = scan_start_handler };
+  httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_handler };
+  httpd_uri_t dist = { .uri = "/dist", .method = HTTP_GET, .handler = dist_handler };
 
   if (httpd_start(&server, &config) == ESP_OK) {
     httpd_register_uri_handler(server, &root);
@@ -249,7 +392,12 @@ void startCameraServer() {
     httpd_register_uri_handler(server, &status);
     httpd_register_uri_handler(server, &kick);
     httpd_register_uri_handler(server, &turncap);
-    Serial.println("HTTP: /move /kick /turncap /capture /stream /status");
+    httpd_register_uri_handler(server, &trim);
+    httpd_register_uri_handler(server, &stopcm);
+    httpd_register_uri_handler(server, &scanstart);
+    httpd_register_uri_handler(server, &scan);
+    httpd_register_uri_handler(server, &dist);
+    Serial.println("HTTP: /move /kick /turncap /trim /stopcm /scan/start /scan /dist /capture /stream /status");
   } else {
     Serial.println("HTTP start failed");
   }
@@ -288,5 +436,6 @@ void setup() {
 }
 
 void loop() {
-  delay(1000);
+  pollRoverSerial();
+  delay(5);
 }
